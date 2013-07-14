@@ -2,3 +2,9 @@ QuadcopterDRDO1
 ===============
 
 Quadcopter coded during summer 2013
+
+BUGS / TODO
+
+REMOVE FLAG SETTING FOR THROTTLE RESPONSE.
+MODIFY PWM CONTROLLER
+INCREASE RF LINK BAUD RATE

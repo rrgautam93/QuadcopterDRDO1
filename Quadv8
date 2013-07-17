@@ -1,0 +1,499 @@
+// I2C device class by Jeff Rowberg MPU6050 class using DMP (MotionApps v2.0)
+//@RRG V0.8
+/*CHGLOG
+ 29-6 Initial Version    (RRG)
+ 1-7  PID controller fixed    (RRG)
+ 3-7  Motor Control codes (RRG)
+ 4-7  Serial link Codes  (RRG)
+ 9-7  Serial Link Working.Throttle auto limits added.  (RRG)
+ 11-7 Added Battery Volt checker code, Yaw manual control codes (RRG)
+ 13-7 Added initial delay to let imu settle   (RRG)
+ 14-7 Added bias correction (RRG)
+ 15-7 Updated throttle response code(throttle response should be near instantaneous)(once every 10 millisecs)   (RRG)
+ 15-7 Derivative kick removed(should respond much more smoothly to state change input)    (RRG)
+ 15-7 Debug mode added(in step to arm motors u can press other key to monitor vital stats)   (RRG)
+ 16-7 Bias correction removed(ypr already includes it) (RRG)
+ 16-7 Crash cutoff code under construction (RRG)
+ */
+/*KNOWN BUGS:
+ IMU Has a very small chance of RANDOMLY FREEZing(dont know y). Must change code to accomodate such a freeze.
+ OBSERVATION: RF LINK BUFFER SEEMS TO BE ABT 32 Bytes. ANYTHING LONGER ISNT COMPLETELY TRANSMITTED
+ ANOTHER: PRESSING and holding DOWN A BUTTON CAUSES THAT BUTTON's signal to be transmitted even after the button is released(Some queueing). THIS CAN BE CATASTROPHIC
+ */
+
+#include "Wire.h"
+#include <Servo.h>                    
+#include "I2Cdev.h"
+#include "MPU6050_6Axis_MotionApps20.h"
+
+#include "Arduino.h"
+void dmpDataReady();
+void update(char c);
+void setup();
+void loop();
+
+MPU6050 mpu;
+
+//IMU FIFO Rate can be set on line 261 of MPU6050_6Axis_MotionApps20.h set to 67Hz(0x02)(for debugging) or 100 Hz(0x01) for running(recommend do not change unless u  know what u want to do)
+//Going more than 100 Hz not recommended as arduino seems to be  unable to keep up with IMU resulting in FIFO buffer overflow which results in junk values and freeze
+//Use 67Hz if debugging bcoz areduino serial commands cause lag
+
+/*
+QUAD X CONFIG                                //check thi later
+ -                 |
+ 1   2               |
+ X    -            | X
+ 3   4              \|/
+ 
+ ------->
+ Y
+ 
+ motors 1 and 2 are mounted on red arms. SO RED PART IS FORWARD
+ Nose down is -ve pitch
+ Starboard down is -ve roll
+ (clockwise -ve)
+ rotation(yaw) left(anti clockwise) is +ve. 
+ MOTORS 1&4 are clockwise. 2 &3 are anti
+ Connection guide
+ Arduino                          MPU6050
+ 3.3V                              Vcc
+ GND(corresponding to 3.3V         GND
+ SDA                               SDA
+ SCL                               SCL
+ PIN 2                             INT
+ RF MODULE
+ TX1                                RX
+ RX1                                TX
+ 5v                                 Vcc
+ Gnd(corresponding to 5v)           GND 
+ Volt checker
+ A0                                 Battery 1st cell monitor(balance port. connect to 1st cell output(2nd from black wire))
+ ============================================================ */
+
+//MOTOR Vars
+int throttle=0;
+char motarm= 'n';
+Servo M1;
+Servo M2;
+Servo M3;
+Servo M4;
+
+#define LED_PIN 13
+bool blinkState = false;
+
+//PID vars
+//float yprbias[2]={0,0};  // to remove small angular offset errors. NOT REQD
+//int i=0;
+unsigned long w=0;
+bool uno=false;      //first time operation flag for imu warmup
+bool iuno=false;     //inner loop first time executor 
+float Inte[2]={
+  0,0};          //INTEGRATED ERROR CONTAINER
+float dt=0.01;                   // 100Hz OPN CHANGE AS REQD (SEE FIFO RATE)
+float yprgoal[3]={
+  0,0,0};                  //THIS HAS TO BE UPDATED THRU LINK
+float throttlepr[2]={
+  0,0};
+int thryaw=0;                //YAW CONTROLLER
+float K=1,Kp=0.5,Kd=0.1,Ki=0.08;    //TUNE AS NECESSARY       
+float err[2]={
+  0,0};                
+float errold[2]={
+  0,0};         
+
+//Serial link vars
+bool updflag=false;
+unsigned long lsttime=0;
+unsigned long time;
+
+
+// MPU control/status vars
+bool dmpReady = false;  // set true if DMP init was successful
+uint8_t mpuIntStatus;   // holds actual interrupt status byte from MPU
+uint8_t devStatus;      // return status after each device operation (0 = success, !0 = error)
+uint16_t packetSize;    // expected DMP packet size (default is 42 bytes)
+uint16_t fifoCount;     // count of all bytes currently in FIFO
+uint8_t fifoBuffer[64]; // FIFO storage buffer
+
+// orientation/motion vars
+Quaternion q;
+VectorInt16 aa;         // [x, y, z]            accel sensor measurements
+//VectorInt16 aaReal;     // [x, y, z]            gravity-free accel sensor measurements
+VectorFloat gravity;
+float ypr[3];           // [yaw, pitch, roll]   yaw/pitch/roll container and gravity vector
+
+// ================================================================
+// ===               INTERRUPT DETECTION ROUTINE                ===
+// ================================================================
+
+volatile bool mpuInterrupt = false;     // indicates whether MPU interrupt pin has gone high
+void dmpDataReady() {
+  mpuInterrupt = true;
+}
+//================================================================
+//======        GOAL UPDATE ROUTINE==============================
+
+void update(char c){            
+  Serial.println(c);
+  switch (c){                   //Also must regulate execution time of this fn
+  case 'w':              //STATE GOAL CHANGES PROBABLY ALSO REQUIRE INTEGRATED ERROR RESETS. NOT SURE
+    yprgoal[0]=0;
+    yprgoal[1]=7;
+    yprgoal[2]=0;
+    updflag=true; 
+    break;     
+  case 's':
+    yprgoal[0]=0;
+    yprgoal[1]=-7;
+    yprgoal[2]=0;
+    updflag=true; 
+    break;
+  case 'a':
+    yprgoal[0]=0;
+    yprgoal[1]=0;
+    yprgoal[2]=-7;
+    updflag=true; 
+    break;
+  case 'q':
+    thryaw=7; 
+    updflag=true;
+    break;
+  case 'e':
+    thryaw=-7;
+    updflag=true;
+    break;
+  case 'd':
+    yprgoal[0]=0;
+    yprgoal[1]=0;
+    yprgoal[2]=7;
+    updflag=true; 
+    break;
+  case 'u':
+    throttle-=2;
+Serial.println(throttle);    
+    if(throttle<0)        //THROTTLE CANT GO -VE
+      throttle=0;
+    break;
+  case 'i':
+    throttle+=2;
+    Serial.println(throttle);
+    if(throttle>150)    //MAXIMUM base THROTTLE SET TO 150. REST OF IT LEFT for PITCH AND ROLL COMPOMPONENTS
+      throttle=150;    
+    break;
+  case 'h':
+    Inte[0]=0;
+    Inte[1]=0;  
+    break;
+
+  case 'o':
+    throttle+=5;
+    Serial.println(throttle);
+    if(throttle>150)    //MAXIMUM base THROTTLE SET TO 150. REST OF IT LEFT for PITCH AND ROLL COMPOMPONENTS
+      throttle=150;    
+    break;
+  case 'y':
+    throttle-=5;      //THROTTLE CANT GO -VE
+    Serial.println(throttle);
+    if(throttle<0)
+      throttle=0;    
+    break;
+  case 'x':
+    throttle=0;   //for throttle cutoff.USE WITH CAUTION. X PRESS means instant throttle cut off(Use judiciously)    
+    break;
+  case '!':  //Shift +1. for LANDING and disarming. DO NOT USE UNLESS LANDED
+    throttle=0;
+    M1.write(10); 
+    M2.write(10);
+    M3.write(10);
+    M4.write(10);
+    motarm='n';  
+    break;
+  case '^':  //Shift +6. ONLY FOR REARMING.. NOT  SURE IF NEEDED
+    throttle=0;
+    M1.write(10); 
+    M2.write(10);
+    M3.write(10);
+    M4.write(10);
+    motarm='a';   
+    break;
+    case 't':  //Take off mode
+    K=0;
+    break;
+    case 'r':  //Normal flight mode
+    K=1;
+     break;
+    case 'p':
+    Serial.println(throttle); // Ping signal
+    break;
+    
+  default:
+    break;
+  }
+}
+
+// ================================================================
+// ===                      INITIAL SETUP                       ===
+// ================================================================
+
+void setup() {
+  M1.attach(9);
+  M2.attach(10);
+  M3.attach(11);
+  M4.attach(8);          //Pin 12 seems non functional from flight testing. changed to 8
+  Wire.begin();          //Start I2C
+  Serial.begin(115200);    //Seems a bit too high. Can be reduced once RF linking done
+  Serial1.begin(9600);    //Serial comms on Tx 1/Rx 1 . increase this more to see if reliability of rf link improves.
+
+  //initialize motor
+  Serial.println("Please wait while ESCs finish start up");
+  Serial1.println("Turn off CAPS LOCK ");
+  Serial1.println("NEVER HOLD BUTTON DOWN ");
+  Serial1.println("Enter a to arm motors OR");
+  Serial.println("q to see motor servo outputs");
+  Serial.println("w to see pitch and roll outputs");
+  Serial.println("e to see integrated errors");
+  Serial1.println("Any other key to skip");
+  while (!Serial1.available());  // wait for data
+  motarm=Serial1.read();
+  if(motarm=='a'){
+    M1.write(10); 
+    M2.write(10);
+    M3.write(10);
+    M4.write(10);
+    Serial.println("MOTORS ARMED. BE CAREFUL.");
+  }
+  // initialize IMU
+  Serial.println(F("Initializing I2C devices..."));
+  mpu.initialize();
+  // verify connection
+  Serial.println(F("Testing device connections..."));
+  Serial.println(mpu.testConnection() ? F("MPU6050 connection successful") : F("MPU6050 connection failed"));
+  // wait for ready
+  Serial.println(F("\nPLACE QUADROTOR ON A FLAT SURFACE AND PRESS ANY KEY"));
+  while (Serial1.available() && Serial1.read()); // empty buffer
+  while (!Serial1.available());                 // wait for data
+  while (Serial1.available() && Serial1.read()); // empty buffer again
+  // load and configure the DMP
+  Serial.println(F("Initializing DMP..."));
+  devStatus = mpu.dmpInitialize();
+  // make sure it worked (returns 0 if so)
+  if (devStatus == 0) {
+    // turn on the DMP, now that it's ready
+    Serial.println(F("Enabling DMP..."));
+    mpu.setDMPEnabled(true);
+    // enable Arduino interrupt detection
+    Serial.println(F("Enabling interrupt detection (Arduino external interrupt 0)..."));
+    attachInterrupt(0, dmpDataReady, RISING);
+    mpuIntStatus = mpu.getIntStatus();
+
+    // set our DMP Ready flag so the main loop() function knows it's okay to use it
+    Serial.println(F("DMP ready! Waiting for first interrupt..."));
+    dmpReady = true;
+
+    // get expected DMP packet size for later comparison
+    packetSize = mpu.dmpGetFIFOPacketSize();
+
+  } 
+  else {
+    // ERROR!
+    // 1 = initial memory load failed
+    // 2 = DMP configuration updates failed
+    // (if it's going to break, usually the code will be 1)
+    Serial.print(F("DMP Initialization failed (code "));
+    Serial.print(devStatus);
+    Serial.println(F(")"));
+  }
+
+  // configure LED for output
+  pinMode(LED_PIN, OUTPUT);
+}
+// ================================================================
+// ===                    MAIN PROGRAM LOOP                     ===
+// ================================================================
+
+void loop() {
+  // if programming failed, don't try to do anything
+  if (!dmpReady){
+    Serial.println("IMU STARTUP FAILED. RESET AND TRY AGAIN");
+    Serial1.println("IMU FAILED");  
+    return;
+  }
+  if(!uno){
+    w=millis();
+    uno=true;
+    Serial.println("WAIT FOR IMU TO WARM UP(25s)");
+    Serial1.println("WAIT 25s");
+  }
+  // wait for MPU interrupt or extra packet(s) available
+  while (!mpuInterrupt && fifoCount < packetSize) {
+    // if you are really paranoid you can frequently test in between other
+    // stuff to see if mpuInterrupt is true, and if so, "break;" from the
+    // while() loop to immediately process the MPU data
+  }
+
+  // reset interrupt flag and get INT_STATUS byte
+  mpuInterrupt = false;
+  mpuIntStatus = mpu.getIntStatus();
+
+  // get current FIFO count
+  fifoCount = mpu.getFIFOCount();
+
+  // check for overflow (this should never happen unless our code is too inefficient)
+  if ((mpuIntStatus & 0x10) || fifoCount == 1024) {
+    // reset so we can continue cleanly
+    mpu.resetFIFO();
+    Serial.println(F("FIFO overflow!"));
+    return;
+
+    // otherwise, check for DMP data ready interrupt (this should happen frequently)
+  } 
+  else if (mpuIntStatus & 0x02) {
+    // wait for correct available data length, should be a VERY short wait
+    while (fifoCount < packetSize) fifoCount = mpu.getFIFOCount();
+    //Serial.println(fifoCount);
+    // read a packet from FIFO
+    mpu.getFIFOBytes(fifoBuffer, packetSize);
+
+    // track FIFO count here in case there is > 1 packet available
+    // (this lets us immediately read more without waiting for an interrupt)
+    fifoCount -= packetSize;
+
+    mpu.dmpGetQuaternion(&q, fifoBuffer);
+    mpu.dmpGetAccel(&aa, fifoBuffer);
+    mpu.dmpGetGravity(&gravity, &q);
+    mpu.dmpGetYawPitchRoll(ypr, &q, &gravity);
+
+
+    /* THIS IS TO BE TESTED
+     
+     if(aa.x*aa.x+aa.y*aa.y+aa.z*aa.z>216)  {     //POSSIBLE CRASH(216=(9.8*1.5)^2 .scale up factor 8192 may be reqd . full scale is 2g  must test.
+     while(throttle>0){
+     throttle=throttle-5;
+     M1.write(throttle);
+     M2.write(throttle);
+     M3.write(throttle);
+     M4.write(throttle);
+     delay(2000);
+     }
+     motarm='n';
+     
+     }
+     */
+
+    //IMU outputs offset values for first 20-30 secs. This mainly screws Ki values. Hence ignoring 
+    if(millis()>w+25000){
+      if(!iuno){
+        while (Serial1.available() && Serial1.read());   //EMPTY BUFFERS
+        Serial1.println("READY");
+        iuno=true;  
+    }
+      
+      float yprh[2]={
+        ypr[1] * 57.289226 , ypr[2] * 57.289226*(-1)                        };    // 180/3.141952 =57.289226 , yaw not used so sparing operations on that. Change as per IMU orientation
+      err[0]=yprgoal[1]-yprh[0];
+      err[1]=yprgoal[2]-yprh[1];
+      throttlepr[0]= K*((Kp*err[0])+(Ki*Inte[0])+(Kd*((-1)*yprh[0]-errold[0])/dt));         //derivative kick removed
+      throttlepr[1]= K*((Kp*err[1])+(Ki*Inte[1])+(Kd*((-1)*yprh[1]-errold[1])/dt));         //derivative kick removed
+      Inte[0]=Inte[0]+err[0]*dt;
+      Inte[1]=Inte[1]+err[1]*dt;
+      errold[0]=-yprh[0];
+      errold[1]=-yprh[1];
+      /*  This is the PID before derivative kick removal
+       err[0]=yprgoal[1]-yprh[0];            
+       err[1]=yprgoal[2]-yprh[1];
+       throttlepr[0]= K*((Kp*err[0])+(Ki*Inte[0])+(Kd*(err[0]-errold[0])/dt));
+       throttlepr[1]= K*((Kp*err[1])+(Ki*Inte[1])+(Kd*(err[1]-errold[1])/dt));
+       Inte[0]=Inte[0]+err[0]*dt;
+       Inte[1]=Inte[1]+err[1]*dt;
+       errold[0]=err[0];
+       errold[1]=err[1];*/
+
+      /*
+    float f1,f2,f3,f4;
+       f1=throttlepr[0]/2;
+       f2=throttlepr[0]/2;
+       f3=throttlepr[1]/2;
+       f4=throttlepr[1]/2;
+       int mot1=((f1)+316.4)/54.55;
+       int mot3=((f3)+316.4)/54.55;
+       int mot2=((f1)+316.4)/54.55;
+       int mot4=((f3)+316.4)/54.55;
+       
+       */
+      int mot1=throttle-throttlepr[0]/2+throttlepr[1]/2+thryaw;
+      int mot2=throttle-throttlepr[0]/2-throttlepr[1]/2-thryaw;
+      int mot3=throttle+throttlepr[0]/2-throttlepr[1]/2+thryaw;
+      int mot4=throttle+throttlepr[0]/2+throttlepr[1]/2-thryaw;
+      if(mot1>170)mot1=170;                   //THIS IS PROBABLY NOT THE BEST WAY TO DO THIS
+      if(mot2>170)mot2=170;
+      if(mot3>170)mot3=170;
+      if(mot4>170)mot4=170;
+      if(mot1<0)mot1=0;
+      if(mot2<0)mot2=0;
+      if(mot3<0)mot3=0;
+      if(mot4<0)mot4=0;   
+      if(motarm=='a'){
+        M1.write(mot1);
+        M2.write(mot2);
+        M3.write(mot3);
+        M4.write(mot4);
+      }
+
+      time=millis();          // DO NOT COMMENT THIS OUT. VARIABLE VALUE NECESSARY LATER
+     // Serial.println(time);  
+
+      if(motarm=='q'){
+        //Serial.print("mot1-mot2-mot3-mot4");
+        //Serial.print("\t");      
+        Serial.print(mot1);  
+        Serial.print(",");
+        Serial.print(mot2);
+        Serial.print(",");
+        Serial.print(mot3);
+        Serial.print(",");
+        Serial.println(mot4);
+      }
+      else if(motarm=='w'){
+        //Serial.print("Pitch");
+        //Serial.print("\t");
+        Serial.print(yprh[0]);
+        Serial.print(",");
+        //Serial.print("Roll");
+        //Serial.print(",");
+        Serial.println(yprh[1]); 
+      }
+      else if(motarm=='e'){
+        //Serial.print("Inte0-Inte1");
+        //Serial.print("\t");      
+        Serial.print(Inte[0]);  
+        Serial.print(",");
+        Serial.println(Inte[1]);
+      }
+
+      if(updflag && time>(200 +lsttime)){             //Need to find a better place for these
+        yprgoal[0]=0;
+        yprgoal[1]=0;
+        yprgoal[2]=0;
+        updflag=false;
+        thryaw=0;
+        int sensorValue = analogRead(0);  // CONNECT BTRY GND TO 5V GND and CELL ONE +ve TO A0(analog pin 0)  // THIS WILL REDUCE RF LINK B/W requirement
+        Serial1.print(sensorValue * 0.00488,2);   // 5/1023 = .00488  default 5v ref . OUTPUT TO RF LINK. only 2 decimals needed
+        Serial1.print("\t");
+        Serial1.println(throttle);
+        Serial1.println("res");    
+      }               
+      if(!updflag && Serial1.available()){      
+        update(Serial1.read());                   //Shouldnt be a need to check if input is valid range bcoz it will be coming from our own gui(Switch case can handle it anyways)
+        lsttime=millis();
+        //updflag=true;    // This line moved to inside update fn to decrease throttle response time
+      }  
+
+      // blink LED to indicate activity . quite unnecessary
+      blinkState = !blinkState;
+      digitalWrite(LED_PIN, blinkState);
+    }
+  }
+}
+
+
+
